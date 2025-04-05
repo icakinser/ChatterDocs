@@ -108,9 +108,29 @@ latest_backup = backup_files[-1]
 documents = db.load(latest_backup)
 ```
 
+## New Features (v1.1)
+
+- **Enhanced Document Clustering**:
+  - K-means and DBSCAN algorithms
+  - Automatic cluster summarization
+  - Batch clustering for large datasets
+
+- **Improved API**:
+  - Temperature and max_tokens control
+  - Source document tracking
+  - Detailed version management
+  - Comprehensive system status
+
+- **Robust Error Handling**:
+  - Fallback mechanisms
+  - Detailed error reporting
+  - Processing retries
+
+For complete API documentation including code examples, see [API_DOCS.md](API_DOCS.md)
+
 ## Programmatic Interface
 
-For developers who want to integrate the RAG system into their applications, we provide a Python API:
+For developers who want to integrate the RAG system into their applications, we provide a comprehensive Python API documented in [API_DOCS.md](API_DOCS.md). Key capabilities include:
 
 ```python
 from api import RAGAPI

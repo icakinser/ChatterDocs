@@ -1,5 +1,8 @@
 import logging
 from datetime import datetime
+import numpy as np
+from sklearn.cluster import KMeans, DBSCAN
+from sklearn.metrics import silhouette_score
 from langchain_community.document_loaders import (
     PyPDFLoader,
     TextLoader,
@@ -19,13 +22,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def enrich_metadata(text: str, file_path: str, max_keywords: int = 5) -> dict:
+def enrich_metadata(text: str, file_path: str, max_keywords: int = 5, cluster_id: int = None) -> dict:
     """Extract enhanced metadata from text and file.
     
     Args:
         text: Text content to analyze
         file_path: Path to source file
         max_keywords: Maximum number of keywords to extract
+        cluster_id: Optional cluster assignment ID
         
     Returns:
         Dictionary containing enriched metadata including:
@@ -33,14 +37,45 @@ def enrich_metadata(text: str, file_path: str, max_keywords: int = 5) -> dict:
         - Text statistics
         - File metadata
         - Content features
+        - Cluster ID (if provided)
     """
     import re
     from datetime import datetime
     
-    # Extract keywords
-    r = Rake()
-    r.extract_keywords_from_text(text)
-    keywords = r.get_ranked_phrases()[:max_keywords]
+    # Extract keywords with multiple fallback options
+    keywords = []
+    try:
+        # Try RAKE first
+        try:
+            r = Rake()
+            r.extract_keywords_from_text(text)
+            keywords = r.get_ranked_phrases()[:max_keywords]
+        except Exception as rake_error:
+            logger.warning(f"RAKE keyword extraction failed: {str(rake_error)}")
+            # Fallback 1: Try TF-IDF style extraction
+            try:
+                from sklearn.feature_extraction.text import TfidfVectorizer
+                vectorizer = TfidfVectorizer(stop_words='english', max_features=max_keywords)
+                tfidf = vectorizer.fit_transform([text])
+                keywords = vectorizer.get_feature_names_out().tolist()
+            except Exception as tfidf_error:
+                logger.warning(f"TF-IDF extraction failed: {str(tfidf_error)}")
+                # Fallback 2: Simple word frequency approach
+                try:
+                    from nltk.tokenize import word_tokenize
+                    from nltk.corpus import stopwords
+                    from collections import Counter
+                    words = [word.lower() for word in word_tokenize(text) 
+                            if word.isalpha() and len(word) > 2 
+                            and word.lower() not in stopwords.words('english')]
+                    keywords = [w for w, _ in Counter(words).most_common(max_keywords)]
+                except Exception as nltk_error:
+                    logger.warning(f"Basic word extraction failed: {str(nltk_error)}")
+                    # Final fallback: Simple split
+                    keywords = list(set(text.lower().split()))[:max_keywords]
+    except Exception as e:
+        logger.error(f"All keyword extraction methods failed: {str(e)}")
+        keywords = ["unknown"]  # Fallback minimal value
     
     # Extract potential author/date from text
     author_match = re.search(r'by\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)', text)
@@ -61,17 +96,32 @@ def enrich_metadata(text: str, file_path: str, max_keywords: int = 5) -> dict:
     sentences = re.split(r'[.!?]', text)
     avg_sentence_len = sum(len(s.split()) for s in sentences)/len(sentences) if sentences else 0
     
-    return {
-        'keywords': keywords,
-        'length': len(text),
-        'word_count': len(text.split()),
-        'file_name': file_name,
-        'file_type': file_type,
-        'author': author_match.group(1) if author_match else None,
-        'date': date_match.group() if date_match else None,
-        'avg_sentence_length': round(avg_sentence_len, 1),
-        'processed_at': datetime.now().isoformat()
-    }
+    try:
+        metadata = {
+            'keywords': keywords if keywords else [],  # Ensure empty list if no keywords
+            'length': len(text),
+            'word_count': len(text.split()),
+            'file_name': file_name,
+            'file_type': file_type,
+            'author': author_match.group(1) if author_match else None,
+            'date': date_match.group() if date_match else None,
+            'avg_sentence_length': round(avg_sentence_len, 1) if sentences else 0,
+            'processed_at': datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Error creating metadata: {str(e)}")
+        # Fallback minimal metadata
+        metadata = {
+            'keywords': [],
+            'length': len(text),
+            'word_count': len(text.split()),
+            'file_name': file_name,
+            'file_type': file_type,
+            'processed_at': datetime.now().isoformat()
+        }
+    if cluster_id is not None:
+        metadata['cluster_id'] = cluster_id
+    return metadata
 
 def preprocess_text(text: str) -> str:
     """Clean and normalize text before processing.
@@ -185,13 +235,194 @@ def batch_process(file_paths: List[str], chunk_size: int = 512, chunk_overlap: i
         'stats': stats
     }
 
-def load_and_chunk(file_path: str, chunk_size: int = 512, chunk_overlap: int = 50) -> List[dict]:
+def cluster_documents(
+    chunks: List[dict],
+    n_clusters: int = 5,
+    algorithm: str = "kmeans",
+    min_samples: int = 2,
+    eps: float = 0.5
+) -> Dict[str, Any]:
+    """Cluster document chunks based on their embeddings.
+    
+    Args:
+        chunks: List of document chunks with text and metadata
+        n_clusters: Number of clusters (for KMeans)
+        algorithm: "kmeans" or "dbscan"
+        min_samples: Minimum samples per cluster (for DBSCAN)
+        eps: Maximum distance between samples (for DBSCAN)
+        
+    Returns:
+        Dictionary containing:
+        - labels: Cluster assignments for each chunk
+        - metrics: Clustering quality metrics
+        - algorithm: Algorithm used
+        - params: Parameters used
+    """
+    from langchain_community.embeddings import HuggingFaceEmbeddings
+    
+    logger.info(f"Clustering {len(chunks)} documents using {algorithm}")
+    
+    # Generate embeddings
+    embeddings_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    texts = []
+    for chunk in chunks:
+        if isinstance(chunk, dict):
+            if 'text' in chunk and chunk['text']:
+                texts.append(chunk['text'])
+            elif 'page_content' in chunk and chunk['page_content']:  # Handle LangChain format
+                texts.append(chunk['page_content'])
+            else:
+                logger.warning(f"Skipping chunk missing text content: {chunk}")
+                continue
+        else:
+            logger.warning(f"Skipping non-dict chunk: {chunk}")
+            continue
+    
+    if not texts:
+        logger.warning("No valid text content found for clustering")
+        return {
+            'labels': [],
+            'metrics': {'error': 'No valid text content'},
+            'algorithm': algorithm,
+            'params': {
+                'n_clusters': n_clusters if algorithm == "kmeans" else None,
+                'min_samples': min_samples if algorithm == "dbscan" else None,
+                'eps': eps if algorithm == "dbscan" else None
+            }
+        }
+    
+    embeddings = embeddings_model.embed_documents(texts)
+    
+    # Cluster documents
+    if algorithm == "kmeans":
+        clusterer = KMeans(n_clusters=n_clusters, random_state=42)
+        labels = clusterer.fit_predict(embeddings)
+    elif algorithm == "dbscan":
+        clusterer = DBSCAN(eps=eps, min_samples=min_samples)
+        labels = clusterer.fit_predict(embeddings)
+    else:
+        raise ValueError(f"Unsupported clustering algorithm: {algorithm}")
+    
+    # Calculate metrics
+    metrics = {}
+    if len(set(labels)) > 1:  # Silhouette requires at least 2 clusters
+        metrics['silhouette'] = silhouette_score(embeddings, labels)
+    
+    logger.info(f"Clustering complete. Found {len(set(labels))} clusters")
+    
+    return {
+        'labels': labels.tolist(),
+        'metrics': metrics,
+        'algorithm': algorithm,
+        'params': {
+            'n_clusters': n_clusters if algorithm == "kmeans" else None,
+            'min_samples': min_samples if algorithm == "dbscan" else None,
+            'eps': eps if algorithm == "dbscan" else None
+        }
+    }
+
+def batch_cluster(
+    chunks_list: List[List[dict]],
+    n_clusters: int = 5,
+    algorithm: str = "kmeans",
+    max_workers: int = 4
+) -> List[Dict[str, Any]]:
+    """Cluster multiple sets of documents in parallel.
+    
+    Args:
+        chunks_list: List of document chunk lists to cluster
+        n_clusters: Number of clusters (for KMeans)
+        algorithm: "kmeans" or "dbscan"
+        max_workers: Maximum number of parallel workers
+        
+    Returns:
+        List of clustering results (same format as cluster_documents)
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    
+    results = []
+    
+    def cluster_single(chunks):
+        try:
+            return cluster_documents(chunks, n_clusters, algorithm)
+        except Exception as e:
+            logger.error(f"Clustering failed: {str(e)}")
+            return {
+                'error': str(e),
+                'traceback': traceback.format_exc()
+            }
+    
+    logger.info(f"Starting batch clustering of {len(chunks_list)} document sets")
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(cluster_single, chunks) for chunks in chunks_list]
+        
+        for future in futures:
+            try:
+                result = future.result()
+                results.append(result)
+            except Exception as e:
+                logger.error(f"Unexpected clustering error: {str(e)}")
+                results.append({
+                    'error': str(e),
+                    'traceback': traceback.format_exc()
+                })
+    
+    logger.info("Batch clustering complete")
+    return results
+
+def generate_cluster_summary(chunks: List[dict], labels: List[int]) -> Dict[int, dict]:
+    """Generate summaries for each cluster.
+    
+    Args:
+        chunks: List of document chunks with text and metadata
+        labels: Cluster assignments for each chunk
+        
+    Returns:
+        Dictionary mapping cluster IDs to summary information including:
+        - size: Number of chunks in cluster
+        - top_keywords: Most frequent keywords
+        - sample_text: Representative text sample
+    """
+    from collections import defaultdict
+    
+    clusters = defaultdict(list)
+    for chunk, label in zip(chunks, labels):
+        clusters[label].append(chunk)
+    
+    summaries = {}
+    for label, cluster_chunks in clusters.items():
+        # Get top keywords
+        all_keywords = []
+        for chunk in cluster_chunks:
+            all_keywords.extend(chunk['metadata'].get('keywords', []))
+        
+        from collections import Counter
+        top_keywords = [kw for kw, _ in Counter(all_keywords).most_common(5)]
+        
+        # Get sample text (first 200 chars of first chunk)
+        sample_text = cluster_chunks[0]['text'][:200] + '...' if len(cluster_chunks[0]['text']) > 200 else cluster_chunks[0]['text']
+        
+        summaries[label] = {
+            'size': len(cluster_chunks),
+            'top_keywords': top_keywords,
+            'sample_text': sample_text
+        }
+    
+    return summaries
+
+def load_and_chunk(
+    file_path: str, 
+    chunk_size: int = 512, 
+    chunk_overlap: int = 50,
+    cluster_id: int = None
+) -> List[dict]:
     """Load and chunk documents from various file formats.
     
     Args:
         file_path: Path to the document file
         chunk_size: Size of each chunk in tokens
         chunk_overlap: Overlap between chunks in tokens
+        cluster_id: Optional cluster ID to include in metadata
         
     Returns:
         List of document chunks with metadata
@@ -234,8 +465,12 @@ def load_and_chunk(file_path: str, chunk_size: int = 512, chunk_overlap: int = 5
     enriched_chunks = []
     for i, chunk in enumerate(chunks, 1):
         try:
-            metadata = chunk.metadata.copy()
-            metadata.update(enrich_metadata(chunk.page_content, file_path))
+            metadata = {
+                'source': file_path,  # Required by langchain for source tracking
+                'file_path': file_path,  # Duplicate source for compatibility
+                **chunk.metadata,
+                **enrich_metadata(chunk.page_content, file_path, cluster_id=cluster_id)
+            }
             enriched_chunks.append({
                 'text': chunk.page_content,
                 'metadata': metadata

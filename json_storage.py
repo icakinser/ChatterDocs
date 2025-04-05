@@ -40,10 +40,25 @@ class DocumentDatabase:
         self._loaded_documents = documents
         self._is_loaded = True
     
-    def load(self) -> List[Dict]:
-        """Load documents from database."""
+    def load(self, ensure_dict: bool = True) -> List[Dict]:
+        """Load documents from database.
+        
+        Args:
+            ensure_dict: If True, converts string content to dict when needed
+            
+        Returns:
+            List of document dictionaries
+        """
         if not self._is_loaded:
-            self._loaded_documents = self._load_from_jsonl(self.db_path)
+            raw_docs = self._load_from_jsonl(self.db_path)
+            if ensure_dict:
+                self._loaded_documents = [
+                    doc if isinstance(doc, dict) 
+                    else json.loads(doc) if isinstance(doc, str)
+                    else {} for doc in raw_docs
+                ]
+            else:
+                self._loaded_documents = raw_docs
             self._is_loaded = True
         return self._loaded_documents
     
@@ -62,6 +77,16 @@ class DocumentDatabase:
         logger.info(f"Writing {len(documents)} documents to {output_path}")
         with open(output_path, 'w') as f:
             for i, doc in enumerate(documents, 1):
+                # Ensure document has required fields
+                if not isinstance(doc, dict):
+                    logger.warning(f"Skipping non-dict document: {doc}")
+                    continue
+                if 'text' not in doc:
+                    if 'page_content' in doc:
+                        doc['text'] = doc['page_content']
+                    else:
+                        logger.warning(f"Skipping document missing text: {doc}")
+                        continue
                 f.write(json.dumps(doc) + '\n')
                 if i % 10 == 0 or i == len(documents):
                     logger.debug(f"Written {i}/{len(documents)} documents")
